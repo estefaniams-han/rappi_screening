@@ -1,7 +1,9 @@
 import os
 import json
+import re
+import inspect
 from dotenv import load_dotenv
-import requests
+from groq import Groq
 import pandas as pd
 
 from bot.tools import (
@@ -16,7 +18,7 @@ from bot.prompts import SYSTEM_PROMPT
 
 load_dotenv(override=True)
 
-MODEL = "llama-3.3-70b-versatile"
+MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 # ---------------------------------------------------------------------------
 # Definición de tools para Groq (formato OpenAI function calling)
@@ -37,9 +39,9 @@ TOOL_DEFINITIONS = [
                 "type": "object",
                 "properties": {
                     "metric":    {"type": "string", "description": "Nombre exacto de la métrica"},
-                    "n":         {"type": "integer", "description": "Número de zonas a retornar (default 5)"},
+                    "n":         {"type": "string", "description": "Número de zonas a retornar (default 5)"},
                     "week":      {"type": "string", "description": "Semana: 'current', 'L1W', 'L2W', etc."},
-                    "ascending": {"type": "boolean", "description": "True para bottom N, False para top N"},
+                    "ascending": {"type": "string", "description": "true para bottom N, false para top N"},
                     "country":   {"type": "string", "description": "Código de país (AR, MX, CO, etc.)"},
                     "city":      {"type": "string", "description": "Nombre de ciudad"},
                     "zone_type": {"type": "string", "description": "'Wealthy' o 'Non Wealthy'"},
@@ -198,15 +200,7 @@ class RappiAgent:
     def __init__(self, metrics_df: pd.DataFrame, orders_df: pd.DataFrame):
         self.metrics_df = metrics_df
         self.orders_df = orders_df
-        self.api_key = os.getenv("GROQ_API_KEY")
-        # Cloudflare bloquea el user-agent por defecto de los SDKs de Python.
-        # Usamos requests con user-agent de curl para bypassearlo.
-        self.session = requests.Session()
-        self.session.headers.update({
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": "curl/8.4.0",
-        })
+        self.client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
         # Historial de la conversación: lista de dicts con role y content.
         # Siempre empieza con el system prompt que define el comportamiento del bot.
@@ -227,48 +221,43 @@ class RappiAgent:
         # Agrega el mensaje del usuario al historial
         self.history.append({"role": "user", "content": user_message})
 
-        def _call_groq(messages: list, use_tools: bool = True) -> dict:
-            """Hace una llamada a la API de Groq y retorna el mensaje de respuesta como dict."""
-            payload = {"model": MODEL, "messages": messages}
-            if use_tools:
-                payload["tools"] = TOOL_DEFINITIONS
-                payload["tool_choice"] = "auto"
-            r = self.session.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                json=payload,
-                timeout=30,
-            )
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"]
-
         # --- Ronda 1: LLM decide si usar una tool o responder directo ---
-        message = _call_groq(self.history)
+        response = self.client.chat.completions.create(
+            model=MODEL,
+            messages=self.history,
+            tools=TOOL_DEFINITIONS,
+            tool_choice="auto",
+        )
+
+        message = response.choices[0].message
 
         # Verifica si el LLM quiere llamar una o más funciones
-        if message.get("tool_calls"):
-            # Guarda el turno del asistente en el historial
+        if message.tool_calls:
             self.history.append(message)
 
-            for tool_call in message["tool_calls"]:
-                tool_name = tool_call["function"]["name"]
-                tool_args = json.loads(tool_call["function"]["arguments"])
+            for tool_call in message.tool_calls:
+                tool_name = tool_call.function.name
+                tool_args = json.loads(tool_call.function.arguments)
+                tool_args = _normalize_locations(user_message, tool_args, self.metrics_df)
 
-                # Ejecuta la función Python con los datos reales
                 result = _dispatch_tool(tool_name, tool_args,
                                         self.metrics_df, self.orders_df)
                 tool_result = result
 
-                # Devuelve el resultado al historial para que el LLM lo narre
                 self.history.append({
                     "role": "tool",
-                    "tool_call_id": tool_call["id"],
+                    "tool_call_id": tool_call.id,
                     "content": json.dumps(result, ensure_ascii=False),
                 })
 
             # --- Ronda 2: LLM narra el resultado en lenguaje natural ---
-            message = _call_groq(self.history, use_tools=False)
+            response = self.client.chat.completions.create(
+                model=MODEL,
+                messages=self.history,
+            )
+            message = response.choices[0].message
 
-        response_text = message.get("content") or ""
+        response_text = message.content or ""
 
         # Guarda la respuesta final del asistente en el historial
         self.history.append({"role": "assistant", "content": response_text})
