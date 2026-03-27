@@ -1,7 +1,7 @@
 import os
 import json
 from dotenv import load_dotenv
-from openai import OpenAI
+import requests
 import pandas as pd
 
 from bot.tools import (
@@ -14,10 +14,9 @@ from bot.tools import (
 )
 from bot.prompts import SYSTEM_PROMPT
 
-load_dotenv()
+load_dotenv(override=True)
 
-MODEL = "llama3.1:8b-instruct-q3_K_M"
-OLLAMA_BASE_URL = "http://localhost:11434/v1"
+MODEL = "llama-3.3-70b-versatile"
 
 # ---------------------------------------------------------------------------
 # Definición de tools para Groq (formato OpenAI function calling)
@@ -162,33 +161,6 @@ TOOL_DEFINITIONS = [
 
 
 # ---------------------------------------------------------------------------
-# Parser de fallback: modelos locales a veces mandan el tool call en content
-# ---------------------------------------------------------------------------
-
-def _parse_tool_call_from_content(content: str) -> tuple[str, dict] | None:
-    """
-    Algunos modelos locales (llama3.1, qwen) mandan el JSON del tool call
-    en el campo 'content' en vez de 'tool_calls'. Este parser lo detecta
-    y extrae nombre + argumentos para que el agente pueda ejecutarlo igual.
-    """
-    if not content or not content.strip().startswith("{"):
-        return None
-    try:
-        data = json.loads(content.strip())
-        name = data.get("name") or data.get("function")
-        # Acepta tanto "arguments" como "parameters" según el modelo
-        args = data.get("arguments") or data.get("parameters") or {}
-        if name and name in {
-            "get_top_zones", "compare_groups", "get_zone_trend",
-            "aggregate_metric", "multivariable_filter", "get_orders_trend"
-        }:
-            return name, args
-    except (json.JSONDecodeError, AttributeError):
-        pass
-    return None
-
-
-# ---------------------------------------------------------------------------
 # Despachador: mapea nombre de función -> función Python real
 # ---------------------------------------------------------------------------
 
@@ -226,9 +198,15 @@ class RappiAgent:
     def __init__(self, metrics_df: pd.DataFrame, orders_df: pd.DataFrame):
         self.metrics_df = metrics_df
         self.orders_df = orders_df
-        # Ollama expone una API compatible con OpenAI en localhost
-        # api_key="ollama" es un placeholder — Ollama no requiere autenticación
-        self.client = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
+        self.api_key = os.getenv("GROQ_API_KEY")
+        # Cloudflare bloquea el user-agent por defecto de los SDKs de Python.
+        # Usamos requests con user-agent de curl para bypassearlo.
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "curl/8.4.0",
+        })
 
         # Historial de la conversación: lista de dicts con role y content.
         # Siempre empieza con el system prompt que define el comportamiento del bot.
@@ -249,57 +227,48 @@ class RappiAgent:
         # Agrega el mensaje del usuario al historial
         self.history.append({"role": "user", "content": user_message})
 
+        def _call_groq(messages: list, use_tools: bool = True) -> dict:
+            """Hace una llamada a la API de Groq y retorna el mensaje de respuesta como dict."""
+            payload = {"model": MODEL, "messages": messages}
+            if use_tools:
+                payload["tools"] = TOOL_DEFINITIONS
+                payload["tool_choice"] = "auto"
+            r = self.session.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                json=payload,
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]
+
         # --- Ronda 1: LLM decide si usar una tool o responder directo ---
-        response = self.client.chat.completions.create(
-            model=MODEL,
-            messages=self.history,
-            tools=TOOL_DEFINITIONS,
-            tool_choice="auto",  # el LLM decide si usar tool o responder directo
-        )
+        message = _call_groq(self.history)
 
-        message = response.choices[0].message
-
-        # Verifica si el LLM quiere llamar una función.
-        # Primero revisa tool_calls (API nativa), luego el fallback de content JSON.
-        tool_calls_to_run = []
-
-        if message.tool_calls:
-            # Camino feliz: el modelo usó el formato correcto de tool calling
+        # Verifica si el LLM quiere llamar una o más funciones
+        if message.get("tool_calls"):
+            # Guarda el turno del asistente en el historial
             self.history.append(message)
-            for tc in message.tool_calls:
-                tool_calls_to_run.append((tc.function.name,
-                                          json.loads(tc.function.arguments),
-                                          tc.id))
-        else:
-            # Fallback: modelos locales a veces mandan el JSON en content
-            parsed = _parse_tool_call_from_content(message.content or "")
-            if parsed:
-                tool_name, tool_args = parsed
-                fake_id = "local_tool_0"
-                # Guardamos el turno del asistente antes de ejecutar
-                self.history.append({"role": "assistant", "content": message.content})
-                tool_calls_to_run.append((tool_name, tool_args, fake_id))
 
-        if tool_calls_to_run:
-            for tool_name, tool_args, tool_id in tool_calls_to_run:
+            for tool_call in message["tool_calls"]:
+                tool_name = tool_call["function"]["name"]
+                tool_args = json.loads(tool_call["function"]["arguments"])
+
+                # Ejecuta la función Python con los datos reales
                 result = _dispatch_tool(tool_name, tool_args,
                                         self.metrics_df, self.orders_df)
                 tool_result = result
 
+                # Devuelve el resultado al historial para que el LLM lo narre
                 self.history.append({
                     "role": "tool",
-                    "tool_call_id": tool_id,
+                    "tool_call_id": tool_call["id"],
                     "content": json.dumps(result, ensure_ascii=False),
                 })
 
             # --- Ronda 2: LLM narra el resultado en lenguaje natural ---
-            response = self.client.chat.completions.create(
-                model=MODEL,
-                messages=self.history,
-            )
-            message = response.choices[0].message
+            message = _call_groq(self.history, use_tools=False)
 
-        response_text = message.content or ""
+        response_text = message.get("content") or ""
 
         # Guarda la respuesta final del asistente en el historial
         self.history.append({"role": "assistant", "content": response_text})
