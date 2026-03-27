@@ -163,12 +163,81 @@ TOOL_DEFINITIONS = [
 
 
 # ---------------------------------------------------------------------------
+# Normalizador de ubicaciones: fuzzy-match zona/ciudad contra los datos reales
+# ---------------------------------------------------------------------------
+
+COUNTRY_NAME_TO_CODE = {
+    "argentina": "AR", "brasil": "BR", "brazil": "BR", "chile": "CL",
+    "colombia": "CO", "costa rica": "CR", "ecuador": "EC",
+    "mexico": "MX", "méxico": "MX", "peru": "PE", "perú": "PE",
+    "uruguay": "UY",
+}
+
+
+def _normalize_locations(user_message: str, args: dict, metrics_df: pd.DataFrame) -> dict:
+    """
+    Corrige nombres de zona, ciudad y país para que coincidan con los datos reales.
+    - País: nombre completo → código ISO (ej: "Mexico" → "MX")
+    - Zona/Ciudad: fuzzy match case-insensitive contra los valores del DataFrame
+    """
+    normalized = dict(args)
+
+    # Normaliza país: nombre → código
+    if normalized.get("country"):
+        key = normalized["country"].strip().lower()
+        if key in COUNTRY_NAME_TO_CODE:
+            normalized["country"] = COUNTRY_NAME_TO_CODE[key]
+        else:
+            normalized["country"] = normalized["country"].upper()
+
+    # Fuzzy match para zona, ciudad y métrica
+    for field, col in [("zone", "ZONE"), ("city", "CITY"), ("metric", "METRIC")]:
+        if not normalized.get(field):
+            continue
+
+        query = normalized[field].strip().lower()
+        candidates = metrics_df[col].dropna().unique()
+
+        # Coincidencia exacta (case-insensitive)
+        exact = [c for c in candidates if c.lower() == query]
+        if exact:
+            normalized[field] = exact[0]
+            continue
+
+        # Búsqueda parcial: el query está contenido en el candidato o viceversa
+        partial = [c for c in candidates if query in c.lower() or c.lower() in query]
+        if len(partial) == 1:
+            normalized[field] = partial[0]
+        elif len(partial) > 1:
+            # Si hay varios, elige el más corto (más específico suele ser el correcto)
+            normalized[field] = min(partial, key=len)
+
+    return normalized
+
+
+# ---------------------------------------------------------------------------
 # Despachador: mapea nombre de función -> función Python real
 # ---------------------------------------------------------------------------
+
+def _coerce_args(args: dict) -> dict:
+    """Convierte strings a int/bool cuando el modelo los manda con tipo incorrecto."""
+    result = {}
+    for k, v in args.items():
+        if v == "" or v is None:
+            continue
+        if k in {"n", "n_weeks", "top_n"} and isinstance(v, str):
+            result[k] = int(v) if v.strip().isdigit() else v
+        elif k == "ascending" and isinstance(v, str):
+            result[k] = v.strip().lower() == "true"
+        else:
+            result[k] = v
+    return result
+
 
 def _dispatch_tool(name: str, args: dict,
                    metrics_df: pd.DataFrame, orders_df: pd.DataFrame) -> dict:
     """Ejecuta la tool correspondiente con los argumentos que decidió el LLM."""
+    args = _coerce_args(args)
     if name == "get_top_zones":
         return get_top_zones(metrics_df, **args)
     elif name == "compare_groups":
@@ -230,6 +299,23 @@ class RappiAgent:
         )
 
         message = response.choices[0].message
+
+        # Si el modelo respondió con texto pero la pregunta parece requerir datos,
+        # reintentamos forzando que use una tool (tool_choice="required").
+        # Esto evita que el modelo pida confirmación innecesaria.
+        ASK_PATTERNS = ["podrías decirme", "necesito más información",
+                        "¿podrías", "¿podría", "could you", "please provide",
+                        "asumiré", "en qué ciudad", "en qué país", "qué semana"]
+        if not message.tool_calls and message.content:
+            content_lower = message.content.lower()
+            if any(p in content_lower for p in ASK_PATTERNS):
+                response = self.client.chat.completions.create(
+                    model=MODEL,
+                    messages=self.history,
+                    tools=TOOL_DEFINITIONS,
+                    tool_choice="required",
+                )
+                message = response.choices[0].message
 
         # Verifica si el LLM quiere llamar una o más funciones
         if message.tool_calls:

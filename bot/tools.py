@@ -2,8 +2,17 @@ import pandas as pd
 from data_loader import WEEK_COLS, WEEK_COLS_ORDERS
 
 # Mapeo semana -> etiqueta legible
-WEEK_LABELS = {col: f"W-{8 - i}" if i < 8 else "Current" for i, col in enumerate(WEEK_COLS)}
-WEEK_LABELS_ORDERS = {col: f"W-{8 - i}" if i < 8 else "Current" for i, col in enumerate(WEEK_COLS_ORDERS)}
+# L8W = hace 8 semanas, L0W = semana actual
+def _make_labels(cols):
+    labels = {}
+    n = len(cols)
+    for i, col in enumerate(cols):
+        weeks_ago = n - 1 - i
+        labels[col] = "Sem. actual" if weeks_ago == 0 else f"Hace {weeks_ago} sem."
+    return labels
+
+WEEK_LABELS = _make_labels(WEEK_COLS)
+WEEK_LABELS_ORDERS = _make_labels(WEEK_COLS_ORDERS)
 
 
 # ---------------------------------------------------------------------------

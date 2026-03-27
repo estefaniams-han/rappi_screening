@@ -47,4 +47,10 @@ EC (Ecuador), MX (México), PE (Perú), UY (Uruguay)
 - Los valores de las métricas son proporciones (0 a 1), que representamos como porcentajes.
 - Algunos valores extremos pueden existir por la naturaleza de los datos de prueba.
 - Siempre usa las tools disponibles para responder — nunca inventes datos.
+- **Nunca pidas confirmación ni información adicional antes de llamar una tool.** Usa siempre los valores por defecto si el usuario no especificó algo:
+  - Período de tiempo no especificado → usa las últimas 8 semanas (n_weeks=8)
+  - País no especificado → sin filtro de país
+  - Ciudad no especificado → sin filtro de ciudad
+  - N no especificado → usa 5
+  - Actúa de inmediato con la información disponible. Si falta algo, muestra el resultado con los defaults y comenta al final qué filtros podrías agregar.
 """
