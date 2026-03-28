@@ -3,6 +3,7 @@ import json
 import re
 import inspect
 from dotenv import load_dotenv
+import groq
 from groq import Groq
 import pandas as pd
 
@@ -166,51 +167,60 @@ TOOL_DEFINITIONS = [
 # Normalizador de ubicaciones: fuzzy-match zona/ciudad contra los datos reales
 # ---------------------------------------------------------------------------
 
-COUNTRY_NAME_TO_CODE = {
-    "argentina": "AR", "brasil": "BR", "brazil": "BR", "chile": "CL",
-    "colombia": "CO", "costa rica": "CR", "ecuador": "EC",
-    "mexico": "MX", "méxico": "MX", "peru": "PE", "perú": "PE",
-    "uruguay": "UY",
-}
-
-
 def _normalize_locations(user_message: str, args: dict, metrics_df: pd.DataFrame) -> dict:
     """
     Corrige nombres de zona, ciudad y país para que coincidan con los datos reales.
-    - País: nombre completo → código ISO (ej: "Mexico" → "MX")
-    - Zona/Ciudad: fuzzy match case-insensitive contra los valores del DataFrame
+    País: fuzzy match contra los nombres completos del DataFrame (Argentina, México, etc.)
+    Zona/Ciudad/Métrica: fuzzy match case-insensitive.
     """
     normalized = dict(args)
 
-    # Normaliza país: nombre → código
+    # Normaliza país: fuzzy match contra los nombres reales del DataFrame
     if normalized.get("country"):
-        key = normalized["country"].strip().lower()
-        if key in COUNTRY_NAME_TO_CODE:
-            normalized["country"] = COUNTRY_NAME_TO_CODE[key]
+        query = normalized["country"].strip().lower()
+        country_candidates = metrics_df["COUNTRY"].dropna().unique()
+        exact = [c for c in country_candidates if c.lower() == query]
+        if exact:
+            normalized["country"] = exact[0]
         else:
-            normalized["country"] = normalized["country"].upper()
+            partial = [c for c in country_candidates if query in c.lower() or c.lower() in query]
+            if partial:
+                normalized["country"] = min(partial, key=len)
 
-    # Fuzzy match para zona, ciudad y métrica
+    metric_candidates = metrics_df["METRIC"].dropna().unique()
+
+    def _fuzzy_metric(name: str) -> str:
+        """Fuzzy match de un nombre de métrica contra los datos reales."""
+        query = name.strip().lower()
+        exact = [c for c in metric_candidates if c.lower() == query]
+        if exact:
+            return exact[0]
+        partial = [c for c in metric_candidates if query in c.lower() or c.lower() in query]
+        if partial:
+            return min(partial, key=len)
+        return name
+
+    # Fuzzy match para zona, ciudad y métrica (nivel superior)
     for field, col in [("zone", "ZONE"), ("city", "CITY"), ("metric", "METRIC")]:
         if not normalized.get(field):
             continue
-
         query = normalized[field].strip().lower()
         candidates = metrics_df[col].dropna().unique()
-
-        # Coincidencia exacta (case-insensitive)
         exact = [c for c in candidates if c.lower() == query]
         if exact:
             normalized[field] = exact[0]
             continue
-
-        # Búsqueda parcial: el query está contenido en el candidato o viceversa
         partial = [c for c in candidates if query in c.lower() or c.lower() in query]
         if len(partial) == 1:
             normalized[field] = partial[0]
         elif len(partial) > 1:
-            # Si hay varios, elige el más corto (más específico suele ser el correcto)
             normalized[field] = min(partial, key=len)
+
+    # Fuzzy match para métricas dentro de conditions (multivariable_filter)
+    if "conditions" in normalized and isinstance(normalized["conditions"], list):
+        for cond in normalized["conditions"]:
+            if isinstance(cond, dict) and cond.get("metric"):
+                cond["metric"] = _fuzzy_metric(cond["metric"])
 
     return normalized
 
@@ -290,60 +300,78 @@ class RappiAgent:
         # Agrega el mensaje del usuario al historial
         self.history.append({"role": "user", "content": user_message})
 
-        # --- Ronda 1: LLM decide si usar una tool o responder directo ---
-        response = self.client.chat.completions.create(
-            model=MODEL,
-            messages=self.history,
-            tools=TOOL_DEFINITIONS,
-            tool_choice="auto",
-        )
-
-        message = response.choices[0].message
-
-        # Si el modelo respondió con texto pero la pregunta parece requerir datos,
-        # reintentamos forzando que use una tool (tool_choice="required").
-        # Esto evita que el modelo pida confirmación innecesaria.
-        ASK_PATTERNS = ["podrías decirme", "necesito más información",
-                        "¿podrías", "¿podría", "could you", "please provide",
-                        "asumiré", "en qué ciudad", "en qué país", "qué semana"]
-        if not message.tool_calls and message.content:
-            content_lower = message.content.lower()
-            if any(p in content_lower for p in ASK_PATTERNS):
-                response = self.client.chat.completions.create(
-                    model=MODEL,
-                    messages=self.history,
-                    tools=TOOL_DEFINITIONS,
-                    tool_choice="required",
-                )
-                message = response.choices[0].message
-
-        # Verifica si el LLM quiere llamar una o más funciones
-        if message.tool_calls:
-            self.history.append(message)
-
-            for tool_call in message.tool_calls:
-                tool_name = tool_call.function.name
-                tool_args = json.loads(tool_call.function.arguments)
-                tool_args = _normalize_locations(user_message, tool_args, self.metrics_df)
-
-                result = _dispatch_tool(tool_name, tool_args,
-                                        self.metrics_df, self.orders_df)
-                tool_result = result
-
-                self.history.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": json.dumps(result, ensure_ascii=False),
-                })
-
-            # --- Ronda 2: LLM narra el resultado en lenguaje natural ---
+        try:
+            # --- Ronda 1: LLM decide si usar una tool o responder directo ---
             response = self.client.chat.completions.create(
                 model=MODEL,
                 messages=self.history,
+                tools=TOOL_DEFINITIONS,
+                tool_choice="auto",
             )
+
             message = response.choices[0].message
 
-        response_text = message.content or ""
+            # Si el modelo respondió con texto pero la pregunta parece requerir datos,
+            # reintentamos forzando que use una tool (tool_choice="required").
+            # Esto evita que el modelo pida confirmación innecesaria.
+            ASK_PATTERNS = ["podrías decirme", "necesito más información",
+                            "¿podrías", "¿podría", "could you", "please provide",
+                            "asumiré", "en qué ciudad", "en qué país", "qué semana"]
+            if not message.tool_calls and message.content:
+                content_lower = message.content.lower()
+                if any(p in content_lower for p in ASK_PATTERNS):
+                    response = self.client.chat.completions.create(
+                        model=MODEL,
+                        messages=self.history,
+                        tools=TOOL_DEFINITIONS,
+                        tool_choice="required",
+                    )
+                    message = response.choices[0].message
+
+            # Verifica si el LLM quiere llamar una o más funciones
+            if message.tool_calls:
+                self.history.append(message)
+
+                for tool_call in message.tool_calls:
+                    tool_name = tool_call.function.name
+                    tool_args = json.loads(tool_call.function.arguments)
+                    tool_args = _normalize_locations(user_message, tool_args, self.metrics_df)
+
+                    result = _dispatch_tool(tool_name, tool_args,
+                                            self.metrics_df, self.orders_df)
+                    tool_result = result
+
+                    self.history.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": json.dumps(result, ensure_ascii=False),
+                    })
+
+                # --- Ronda 2: LLM narra el resultado en lenguaje natural ---
+                response = self.client.chat.completions.create(
+                    model=MODEL,
+                    messages=self.history,
+                )
+                message = response.choices[0].message
+
+            response_text = message.content or ""
+
+        except groq.BadRequestError:
+            # El modelo generó un tool call con schema inválido.
+            # Limpiamos mensajes de tool del historial y reintentamos sin tools.
+            self.history = [
+                m for m in self.history
+                if isinstance(m, dict) and m.get("role") in ("system", "user")
+            ]
+            try:
+                fallback = self.client.chat.completions.create(
+                    model=MODEL,
+                    messages=self.history,
+                )
+                response_text = fallback.choices[0].message.content or ""
+            except Exception:
+                response_text = "Ocurrió un error procesando tu pregunta. Intenta reformularla."
+                self.history.pop()
 
         # Guarda la respuesta final del asistente en el historial
         self.history.append({"role": "assistant", "content": response_text})

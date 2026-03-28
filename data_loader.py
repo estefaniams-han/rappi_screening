@@ -1,6 +1,11 @@
 import pandas as pd
 from pathlib import Path
 
+COUNTRY_CODE_TO_NAME = {
+    "AR": "Argentina", "BR": "Brasil", "CL": "Chile", "CO": "Colombia",
+    "CR": "Costa Rica", "EC": "Ecuador", "MX": "México", "PE": "Perú", "UY": "Uruguay",
+}
+
 EXCEL_PATH = Path("data/raw/Rappi Operations Analysis Dummy Data.xlsx")
 
 # Semanas en orden cronológico (L8W = más antigua, L0W = más reciente)
@@ -35,6 +40,17 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     for col in ["COUNTRY", "CITY", "ZONE", "ZONE_TYPE", "ZONE_PRIORITIZATION", "METRIC"]:
         metrics_df[col] = metrics_df[col].astype(str).str.strip()
 
+    # Códigos de país → nombres completos
+    metrics_df["COUNTRY"] = metrics_df["COUNTRY"].map(COUNTRY_CODE_TO_NAME).fillna(metrics_df["COUNTRY"])
+
+    # Reemplazamos underscores por espacios y aplicamos title case
+    for col in ["ZONE", "CITY"]:
+        metrics_df[col] = (
+            metrics_df[col]
+            .str.replace("_", " ", regex=False)
+            .str.title()
+        )
+
     # --- Dataset 2: órdenes ---
     orders_df = xl.parse("RAW_ORDERS")
 
@@ -43,6 +59,15 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
 
     for col in ["COUNTRY", "CITY", "ZONE", "METRIC"]:
         orders_df[col] = orders_df[col].astype(str).str.strip()
+
+    orders_df["COUNTRY"] = orders_df["COUNTRY"].map(COUNTRY_CODE_TO_NAME).fillna(orders_df["COUNTRY"])
+
+    for col in ["ZONE", "CITY"]:
+        orders_df[col] = (
+            orders_df[col]
+            .str.replace("_", " ", regex=False)
+            .str.title()
+        )
 
     return metrics_df, orders_df
 

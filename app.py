@@ -1,9 +1,13 @@
 import streamlit as st
 import plotly.express as px
 import pandas as pd
+import io
 
 from data_loader import load_data
 from bot.agent import RappiAgent
+from insights.analyzer import run_all
+from insights.reporter import generate_report
+from insights.pdf_export import insights_to_pdf, chat_result_to_pdf
 
 st.set_page_config(
     page_title="Rappi Intelligence",
@@ -166,6 +170,39 @@ html, body, [class*="css"] {
 /* Spinner */
 [data-testid="stSpinner"] { color: #FF6B35 !important; }
 
+/* Download buttons */
+[data-testid="stDownloadButton"] > button {
+    background: #12151f !important;
+    border: 1px solid #2a2d3e !important;
+    border-radius: 8px !important;
+    color: #d1d5db !important;
+    font-size: 0.78rem !important;
+    padding: 0.3rem 0.6rem !important;
+    transition: all 0.15s !important;
+}
+[data-testid="stDownloadButton"] > button:hover {
+    border-color: #FF6B35 !important;
+    color: #FF6B35 !important;
+    background: #1a1208 !important;
+}
+
+/* Tabs */
+[data-baseweb="tab-list"] {
+    gap: 0.25rem !important;
+    overflow: visible !important;
+}
+[data-baseweb="tab"] {
+    padding: 0.5rem 1.5rem !important;
+    white-space: nowrap !important;
+    overflow: visible !important;
+    min-width: fit-content !important;
+}
+[data-baseweb="tab"] p, [data-baseweb="tab"] span {
+    white-space: nowrap !important;
+    overflow: visible !important;
+    text-overflow: unset !important;
+}
+
 /* Scrollbar */
 ::-webkit-scrollbar { width: 4px; }
 ::-webkit-scrollbar-track { background: #0f1117; }
@@ -184,10 +221,6 @@ footer, #MainMenu { visibility: hidden; }
 @st.cache_resource
 def get_data():
     return load_data()
-
-@st.cache_resource
-def get_agent(_metrics_df, _orders_df):
-    return RappiAgent(_metrics_df, _orders_df)
 
 metrics_df, orders_df = get_data()
 
@@ -260,7 +293,7 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 
 if "agent" not in st.session_state:
-    st.session_state.agent = get_agent(metrics_df, orders_df)
+    st.session_state.agent = RappiAgent(metrics_df, orders_df)
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "pending_question" not in st.session_state:
@@ -270,7 +303,7 @@ if "pending_question" not in st.session_state:
 # Gráficas
 # ---------------------------------------------------------------------------
 
-def render_chart(tool_result: dict | None):
+def render_chart(tool_result: dict | None, key: str = "chart"):
     if not tool_result or "error" in tool_result or not tool_result.get("data"):
         return
 
@@ -294,7 +327,7 @@ def render_chart(tool_result: dict | None):
                           margin=dict(l=0, r=10, t=35, b=0),
                           legend=dict(orientation="h", yanchor="bottom", y=1.02))
         fig.update_xaxes(showgrid=True, gridcolor=GRID)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key=key)
 
     # Comparación entre grupos
     elif tool_result.get("group_by") and "avg_pct" in df.columns:
@@ -311,7 +344,7 @@ def render_chart(tool_result: dict | None):
                               font_family="Inter", title_font_size=13, font_color="#e5e7eb",
                               margin=dict(l=0, r=0, t=35, b=0))
             fig.update_yaxes(showgrid=True, gridcolor=GRID)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key=key)
 
     # Tendencia temporal — línea
     elif "trend" in tool_result:
@@ -334,7 +367,7 @@ def render_chart(tool_result: dict | None):
                           font_family="Inter", title_font_size=13, font_color="#e5e7eb",
                           margin=dict(l=0, r=0, t=35, b=0))
         fig.update_yaxes(showgrid=True, gridcolor=GRID)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key=key)
 
     # Agregación
     elif "zones" in df.columns and "avg_pct" in df.columns:
@@ -352,51 +385,223 @@ def render_chart(tool_result: dict | None):
                               font_family="Inter", title_font_size=13, font_color="#e5e7eb",
                               margin=dict(l=0, r=40, t=35, b=0))
             fig.update_xaxes(showgrid=True, gridcolor=GRID)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key=key)
 
 # ---------------------------------------------------------------------------
-# Chat
+# Tabs: Chatbot | Insights
 # ---------------------------------------------------------------------------
 
-if not st.session_state.messages:
-    with st.chat_message("assistant", avatar="🛵"):
-        st.markdown(
-            "Hola 👋 Soy el asistente de operaciones de Rappi. "
-            "Puedo responder preguntas sobre métricas por zona, ciudad y país.\n\n"
-            "Prueba con algo como:\n"
-            "- *¿Cuáles son las 5 zonas con mayor Lead Penetration esta semana?*\n"
-            "- *Compara Perfect Order entre Wealthy y Non Wealthy en Colombia*\n"
-            "- *¿Qué zonas crecen más en órdenes en las últimas 5 semanas?*"
-        )
+tab_chat, tab_insights = st.tabs(["Chatbot", "Insights automáticos"])
 
-for msg in st.session_state.messages:
-    avatar = "🛵" if msg["role"] == "assistant" else "👤"
-    with st.chat_message(msg["role"], avatar=avatar):
-        st.markdown(msg["content"])
-        if msg.get("chart_data"):
-            render_chart(msg["chart_data"])
+# ---------------------------------------------------------------------------
+# Tab: Insights
+# ---------------------------------------------------------------------------
 
-# Input — puede venir del teclado o del sidebar
-prompt = st.chat_input("Escribe tu pregunta...")
+with tab_insights:
+    st.markdown("### Reporte ejecutivo semanal")
+    st.caption("Detección automática de anomalías, tendencias, benchmarking y oportunidades.")
 
-if st.session_state.pending_question:
-    prompt = st.session_state.pending_question
-    st.session_state.pending_question = None
+    if "insights_data" not in st.session_state:
+        st.session_state.insights_data = None
+    if "insights_report" not in st.session_state:
+        st.session_state.insights_report = None
 
-if prompt:
-    with st.chat_message("user", avatar="👤"):
-        st.markdown(prompt)
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    if st.button("Generar insights", type="primary"):
+        with st.spinner("Analizando datos..."):
+            st.session_state.insights_data = run_all(metrics_df, orders_df)
+        with st.spinner("Generando reporte con IA..."):
+            st.session_state.insights_report = generate_report(st.session_state.insights_data)
 
-    with st.chat_message("assistant", avatar="🛵"):
-        with st.spinner(""):
-            response_text, tool_result = st.session_state.agent.chat(prompt)
-        st.markdown(response_text)
-        render_chart(tool_result)
+    if st.session_state.insights_data:
+        data = st.session_state.insights_data
 
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": response_text,
-        "chart_data": tool_result,
-    })
-    st.rerun()
+        # --- Botones de exportación al inicio ---
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            if data["anomalies"]:
+                pd.DataFrame(data["anomalies"]).to_excel(writer, sheet_name="Anomalías", index=False)
+            if data["worrying_trends"]:
+                pd.DataFrame(data["worrying_trends"]).to_excel(writer, sheet_name="Tendencias", index=False)
+            if data["benchmarking"]:
+                pd.DataFrame(data["benchmarking"]).to_excel(writer, sheet_name="Benchmarking", index=False)
+            if data["correlations"]:
+                pd.DataFrame(data["correlations"]).to_excel(writer, sheet_name="Correlaciones", index=False)
+            if data["opportunities"]:
+                opp_rows = [
+                    {"zone": o["zone"], "country": o["country"], "orders": o["orders"],
+                     "metric": m["metric"], "value": m["value"],
+                     "global_avg": m["global_avg"], "gap_pct": m["gap_pct"]}
+                    for o in data["opportunities"] for m in o["lagging_metrics"]
+                ]
+                pd.DataFrame(opp_rows).to_excel(writer, sheet_name="Oportunidades", index=False)
+        _, exc1, exc2 = st.columns([6, 1, 1])
+        with exc1:
+            st.download_button("↓ Excel", data=buf.getvalue(),
+                               file_name="rappi_insights.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               use_container_width=True)
+        with exc2:
+            st.download_button("↓ PDF",
+                               data=insights_to_pdf(data, st.session_state.insights_report or ""),
+                               file_name="rappi_insights.pdf", mime="application/pdf",
+                               use_container_width=True)
+        st.divider()
+
+    if st.session_state.insights_report:
+        st.markdown(st.session_state.insights_report)
+        st.divider()
+
+    if st.session_state.insights_data:
+        data = st.session_state.insights_data
+
+        col1, col2, col3, col4, col5 = st.columns(5)
+        col1.metric("Anomalías", len(data["anomalies"]))
+        col2.metric("Tendencias", len(data["worrying_trends"]))
+        col3.metric("Benchmarking", len(data["benchmarking"]))
+        col4.metric("Correlaciones", len(data["correlations"]))
+        col5.metric("Oportunidades", len(data["opportunities"]))
+
+        # --- Anomalías ---
+        if data["anomalies"]:
+            st.markdown("#### Anomalías (cambios bruscos semana a semana)")
+            df_anom = pd.DataFrame(data["anomalies"])
+            df_anom["estado"] = df_anom["is_deterioration"].map({True: "Deterioro", False: "Mejora"})
+            df_anom["change_pct"] = df_anom["change_pct"].apply(lambda x: f"{x:+.1f}%")
+            st.dataframe(
+                df_anom[["country", "city", "zone", "metric", "value_prev", "value_curr", "change_pct", "estado", "severity"]],
+                use_container_width=True, hide_index=True
+            )
+
+        # --- Tendencias preocupantes ---
+        if data["worrying_trends"]:
+            st.markdown("#### Tendencias preocupantes (deterioro consistente 3+ semanas)")
+            df_trend = pd.DataFrame(data["worrying_trends"])
+            df_trend["total_change_pct"] = df_trend["total_change_pct"].apply(lambda x: f"{x:+.1f}%")
+            st.dataframe(
+                df_trend[["country", "city", "zone", "metric", "value_start", "value_end", "total_change_pct", "weeks_declining"]],
+                use_container_width=True, hide_index=True
+            )
+
+        # --- Benchmarking ---
+        if data["benchmarking"]:
+            st.markdown("#### Benchmarking (zonas por debajo de su grupo)")
+            df_bench = pd.DataFrame(data["benchmarking"][:20])
+            COLORS = ["#FF6B35", "#FF9F1C", "#2EC4B6", "#3A86FF", "#8338EC"]
+            BG, GRID = "#0f1117", "#1f2232"
+            fig = px.scatter(
+                df_bench, x="group_avg", y="zone_value",
+                color="metric", hover_data=["zone", "country", "z_score"],
+                title="Valor de zona vs promedio del grupo",
+                labels={"zone_value": "Valor zona (%)", "group_avg": "Promedio grupo (%)"},
+                color_discrete_sequence=COLORS,
+            )
+            fig.add_shape(type="line", x0=df_bench["group_avg"].min(), y0=df_bench["group_avg"].min(),
+                          x1=df_bench["group_avg"].max(), y1=df_bench["group_avg"].max(),
+                          line=dict(color="#4b5563", dash="dash"))
+            fig.update_layout(height=350, plot_bgcolor=BG, paper_bgcolor=BG,
+                              font_color="#e5e7eb", font_family="Inter", title_font_size=13,
+                              margin=dict(l=0, r=0, t=35, b=0))
+            st.plotly_chart(fig, use_container_width=True, key=key)
+
+        # --- Correlaciones ---
+        if data["correlations"]:
+            st.markdown("#### Correlaciones entre métricas")
+            df_corr = pd.DataFrame(data["correlations"])
+            st.dataframe(
+                df_corr[["metric_a", "metric_b", "correlation", "direction", "strength"]],
+                use_container_width=True, hide_index=True
+            )
+
+        # --- Oportunidades ---
+        if data["opportunities"]:
+            st.markdown("#### Oportunidades de alto impacto")
+            rows = []
+            for o in data["opportunities"]:
+                for m in o["lagging_metrics"]:
+                    rows.append({
+                        "zone": o["zone"],
+                        "country": o["country"],
+                        "orders/sem": o["orders"],
+                        "metric": m["metric"],
+                        "value (%)": m["value"],
+                        "global avg (%)": m["global_avg"],
+                        "gap (%)": f"{m['gap_pct']:.1f}%",
+                    })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+
+# ---------------------------------------------------------------------------
+# Chat (inside tab)
+# ---------------------------------------------------------------------------
+
+with tab_chat:
+    if not st.session_state.messages:
+        with st.chat_message("assistant", avatar="🛵"):
+            st.markdown(
+                "Hola 👋 Soy el asistente de operaciones de Rappi. "
+                "Puedo responder preguntas sobre métricas por zona, ciudad y país.\n\n"
+                "Prueba con algo como:\n"
+                "- *¿Cuáles son las 5 zonas con mayor Lead Penetration esta semana?*\n"
+                "- *Compara Perfect Order entre Wealthy y Non Wealthy en Colombia*\n"
+                "- *¿Qué zonas crecen más en órdenes en las últimas 5 semanas?*"
+            )
+
+    for i, msg in enumerate(st.session_state.messages):
+        avatar = "🛵" if msg["role"] == "assistant" else "👤"
+        with st.chat_message(msg["role"], avatar=avatar):
+            cd = msg.get("chart_data")
+            data_rows = cd.get("data") or cd.get("top_growing_zones") if cd else None
+            # Botones arriba a la derecha si hay datos exportables
+            if data_rows:
+                query = ""
+                if i > 0 and st.session_state.messages[i - 1]["role"] == "user":
+                    query = st.session_state.messages[i - 1]["content"]
+                df_export = pd.DataFrame(data_rows)
+                _, c1, c2 = st.columns([6, 1, 1])
+                with c1:
+                    st.download_button(
+                        "↓ CSV",
+                        data=df_export.to_csv(index=False).encode("utf-8"),
+                        file_name=f"rappi_resultado_{i}.csv",
+                        mime="text/csv",
+                        key=f"csv_{i}",
+                        use_container_width=True,
+                    )
+                with c2:
+                    st.download_button(
+                        "↓ PDF",
+                        data=chat_result_to_pdf(cd, query),
+                        file_name=f"rappi_resultado_{i}.pdf",
+                        mime="application/pdf",
+                        key=f"pdf_{i}",
+                        use_container_width=True,
+                    )
+            st.markdown(msg["content"])
+            if cd:
+                render_chart(cd, key=f"chart_{i}")
+
+    # Input — puede venir del teclado o del sidebar
+    prompt = st.chat_input("Escribe tu pregunta...")
+
+    if st.session_state.pending_question:
+        prompt = st.session_state.pending_question
+        st.session_state.pending_question = None
+
+    if prompt:
+        with st.chat_message("user", avatar="👤"):
+            st.markdown(prompt)
+        st.session_state.messages.append({"role": "user", "content": prompt})
+
+        with st.chat_message("assistant", avatar="🛵"):
+            with st.spinner(""):
+                response_text, tool_result = st.session_state.agent.chat(prompt)
+            st.markdown(response_text)
+            render_chart(tool_result, key="chart_new")
+
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": response_text,
+            "chart_data": tool_result,
+        })
+        st.rerun()
