@@ -105,6 +105,15 @@ def _markdown_body(pdf: _RappiPDF, text: str):
 # Export público: Insights PDF
 # ---------------------------------------------------------------------------
 
+def _make_pdf() -> _RappiPDF:
+    """Crea e inicializa un PDF con los márgenes y página base."""
+    pdf = _RappiPDF()
+    pdf.set_margins(10, 15, 10)
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    return pdf
+
+
 def insights_to_pdf(insights: dict, report_text: str) -> bytes:
     """
     Genera un PDF completo con el reporte ejecutivo y las tablas de insights.
@@ -112,10 +121,7 @@ def insights_to_pdf(insights: dict, report_text: str) -> bytes:
     Returns:
         bytes del PDF listo para st.download_button
     """
-    pdf = _RappiPDF()
-    pdf.set_margins(10, 15, 10)
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
+    pdf = _make_pdf()
 
     # Título
     pdf.set_font("Helvetica", "B", 18)
@@ -198,10 +204,7 @@ def chat_result_to_pdf(tool_result: dict, query: str = "") -> bytes:
     Returns:
         bytes del PDF listo para st.download_button
     """
-    pdf = _RappiPDF()
-    pdf.set_margins(10, 15, 10)
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
+    pdf = _make_pdf()
 
     pdf.set_font("Helvetica", "B", 14)
     pdf.set_text_color(30, 30, 30)

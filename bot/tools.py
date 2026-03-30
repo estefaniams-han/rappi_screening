@@ -14,6 +14,21 @@ def _make_labels(cols):
 WEEK_LABELS = _make_labels(WEEK_COLS)
 WEEK_LABELS_ORDERS = _make_labels(WEEK_COLS_ORDERS)
 
+# Métricas que NO son proporciones 0-1: se muestran tal cual, sin ×100
+# y tienen unidad propia (ej: USD/orden)
+NON_RATIO_METRICS = {"Gross Profit UE"}
+METRIC_UNITS = {"Gross Profit UE": "USD/orden"}
+
+def _unit(metric: str) -> str:
+    return METRIC_UNITS.get(metric, "%")
+
+def _to_display(value, metric: str):
+    """Convierte un valor a su representación de display.
+    Proporciones (0-1) se multiplican ×100. Las demás se dejan igual."""
+    if metric in NON_RATIO_METRICS:
+        return round(value, 4) if pd.notna(value) else value
+    return round(value * 100, 2) if pd.notna(value) else value
+
 
 # ---------------------------------------------------------------------------
 # Helpers internos
@@ -78,10 +93,11 @@ def get_top_zones(metrics_df: pd.DataFrame, metric: str, n: int = 5,
     df = df[["COUNTRY", "CITY", "ZONE", "ZONE_TYPE", week_col]].dropna(subset=[week_col])
     df = df.sort_values(week_col, ascending=ascending).head(n)
     df = df.rename(columns={week_col: "value"})
-    df["value_pct"] = (df["value"] * 100).round(2)
+    df["value_pct"] = df["value"].apply(lambda v: _to_display(v, metric))
 
     return {
         "metric": metric,
+        "unit": _unit(metric),
         "week": WEEK_LABELS.get(week_col, week_col),
         "type": "bottom" if ascending else "top",
         "n": n,
@@ -119,11 +135,12 @@ def compare_groups(metrics_df: pd.DataFrame, metric: str,
         .reset_index()
         .rename(columns={"mean": "avg", "median": "median", "count": "zones_count"})
     )
-    grouped["avg_pct"] = (grouped["avg"] * 100).round(2)
-    grouped["median_pct"] = (grouped["median"] * 100).round(2)
+    grouped["avg_pct"] = grouped["avg"].apply(lambda v: _to_display(v, metric))
+    grouped["median_pct"] = grouped["median"].apply(lambda v: _to_display(v, metric))
 
     return {
         "metric": metric,
+        "unit": _unit(metric),
         "week": WEEK_LABELS.get(week_col, week_col),
         "group_by": group_by,
         "country": country,
@@ -154,33 +171,35 @@ def get_zone_trend(metrics_df: pd.DataFrame, zone: str, metric: str,
     ].copy()
 
     if df.empty:
-        # Búsqueda parcial si no encuentra exacto
-        df = metrics_df[
-            (metrics_df["METRIC"].str.lower() == metric.lower()) &
-            (metrics_df["ZONE"].str.lower().str.contains(zone.lower()))
-        ].copy()
-
-    if df.empty:
         return {"error": f"No se encontró la zona '{zone}' con métrica '{metric}'."}
 
     row = df.iloc[0]
     trend = [
-        {"week": WEEK_LABELS[col], "value": row[col], "value_pct": round(row[col] * 100, 2)}
+        {"week": WEEK_LABELS[col], "value": row[col], "value_pct": _to_display(row[col], metric)}
         for col in week_cols if col in df.columns and pd.notna(row[col])
     ]
 
     # Calcula cambio total entre primera y última semana disponible
     values = [t["value"] for t in trend]
-    change = ((values[-1] - values[0]) / values[0] * 100) if values[0] != 0 else 0
+    first, last = values[0], values[-1]
+    absolute_change = round(last - first, 4)
+    # Cambio relativo solo tiene sentido cuando el valor inicial es positivo
+    relative_change_pct = (
+        round((last - first) / first * 100, 2)
+        if first > 0
+        else None
+    )
 
     return {
         "zone": row["ZONE"],
         "city": row["CITY"],
         "country": row["COUNTRY"],
         "metric": metric,
+        "unit": _unit(metric),
         "n_weeks": n_weeks,
         "trend": trend,
-        "total_change_pct": round(change, 2),
+        "absolute_change": absolute_change,
+        "relative_change_pct": relative_change_pct,
     }
 
 
@@ -212,12 +231,13 @@ def aggregate_metric(metrics_df: pd.DataFrame, metric: str,
         .rename(columns={"mean": "avg", "min": "min_val", "max": "max_val", "count": "zones"})
         .sort_values("avg", ascending=False)
     )
-    grouped["avg_pct"] = (grouped["avg"] * 100).round(2)
-    grouped["min_pct"] = (grouped["min_val"] * 100).round(2)
-    grouped["max_pct"] = (grouped["max_val"] * 100).round(2)
+    grouped["avg_pct"] = grouped["avg"].apply(lambda v: _to_display(v, metric))
+    grouped["min_pct"] = grouped["min_val"].apply(lambda v: _to_display(v, metric))
+    grouped["max_pct"] = grouped["max_val"].apply(lambda v: _to_display(v, metric))
 
     return {
         "metric": metric,
+        "unit": _unit(metric),
         "week": WEEK_LABELS.get(week_col, week_col),
         "group_by": group_by,
         "data": grouped.to_dict(orient="records"),
@@ -281,15 +301,18 @@ def multivariable_filter(metrics_df: pd.DataFrame,
     result = pivot[mask][["COUNTRY", "CITY", "ZONE", "ZONE_TYPE"] +
                           [c["metric"] for c in conditions if c["metric"] in pivot.columns]]
 
-    # Convierte a porcentaje las métricas numéricas
+    # Convierte a display las métricas numéricas
     metric_cols = [c["metric"] for c in conditions if c["metric"] in result.columns]
     for col in metric_cols:
-        result[col] = (result[col] * 100).round(2)
+        result[col] = result[col].apply(lambda v: _to_display(v, col))
+
+    country_distribution = result["COUNTRY"].value_counts().to_dict()
 
     return {
         "week": WEEK_LABELS.get(week_col, week_col),
         "conditions": conditions,
         "zones_found": len(result),
+        "country_distribution": country_distribution,
         "data": result.head(20).to_dict(orient="records"),
     }
 
@@ -334,15 +357,19 @@ def get_orders_trend(orders_df: pd.DataFrame, metrics_df: pd.DataFrame,
             (metrics_df["METRIC"].isin(key_metrics))
         ][["METRIC", "L0W_ROLL"]].set_index("METRIC")["L0W_ROLL"].to_dict()
 
-        correlations.append({
+        entry = {
             "zone": row["ZONE"],
             "city": row["CITY"],
             "country": row["COUNTRY"],
             "orders_start": row[first_col],
             "orders_current": row[last_col],
             "growth_pct": row["growth_pct"],
-            "metrics": {k: round(v * 100, 2) for k, v in zone_metrics.items() if pd.notna(v)},
-        })
+        }
+        # Aplanamos métricas al nivel superior para que el LLM las procese directamente
+        for k, v in zone_metrics.items():
+            if pd.notna(v):
+                entry[k] = _to_display(v, k)
+        correlations.append(entry)
 
     return {
         "n_weeks": n_weeks,

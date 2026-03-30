@@ -16,6 +16,7 @@ from bot.tools import (
     get_orders_trend,
 )
 from bot.prompts import SYSTEM_PROMPT
+from data_loader import COUNTRY_CODE_TO_NAME
 
 load_dotenv(override=True)
 
@@ -26,6 +27,7 @@ MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 # ---------------------------------------------------------------------------
 # Groq usa el mismo formato de tools que OpenAI: una lista de dicts con
 # "type": "function" y la definición de la función con sus parámetros.
+
 
 TOOL_DEFINITIONS = [
     {
@@ -167,7 +169,7 @@ TOOL_DEFINITIONS = [
 # Normalizador de ubicaciones: fuzzy-match zona/ciudad contra los datos reales
 # ---------------------------------------------------------------------------
 
-def _normalize_locations(user_message: str, args: dict, metrics_df: pd.DataFrame) -> dict:
+def _normalize_locations(args: dict, metrics_df: pd.DataFrame) -> dict:
     """
     Corrige nombres de zona, ciudad y país para que coincidan con los datos reales.
     País: fuzzy match contra los nombres completos del DataFrame (Argentina, México, etc.)
@@ -175,17 +177,31 @@ def _normalize_locations(user_message: str, args: dict, metrics_df: pd.DataFrame
     """
     normalized = dict(args)
 
-    # Normaliza país: fuzzy match contra los nombres reales del DataFrame
+    # Normaliza país: primero intenta el mapeo de código (MX→México), luego fuzzy match
     if normalized.get("country"):
-        query = normalized["country"].strip().lower()
-        country_candidates = metrics_df["COUNTRY"].dropna().unique()
-        exact = [c for c in country_candidates if c.lower() == query]
-        if exact:
-            normalized["country"] = exact[0]
+        query = normalized["country"].strip()
+        # Lookup directo por código (ej. "MX" → "México")
+        code_upper = query.upper()
+        if code_upper in COUNTRY_CODE_TO_NAME:
+            normalized["country"] = COUNTRY_CODE_TO_NAME[code_upper]
         else:
-            partial = [c for c in country_candidates if query in c.lower() or c.lower() in query]
-            if partial:
-                normalized["country"] = min(partial, key=len)
+            query_lower = query.lower()
+            country_candidates = metrics_df["COUNTRY"].dropna().unique()
+            exact = [c for c in country_candidates if c.lower() == query_lower]
+            if exact:
+                normalized["country"] = exact[0]
+            else:
+                # Normaliza tildes para comparación (México→mexico, Brasil→brasil)
+                import unicodedata
+                def _strip_accents(s):
+                    return "".join(c for c in unicodedata.normalize("NFD", s)
+                                   if unicodedata.category(c) != "Mn")
+                q_clean = _strip_accents(query_lower)
+                partial = [c for c in country_candidates
+                           if q_clean in _strip_accents(c.lower())
+                           or _strip_accents(c.lower()) in q_clean]
+                if partial:
+                    normalized["country"] = min(partial, key=len)
 
     metric_candidates = metrics_df["METRIC"].dropna().unique()
 
@@ -314,12 +330,17 @@ class RappiAgent:
             # Si el modelo respondió con texto pero la pregunta parece requerir datos,
             # reintentamos forzando que use una tool (tool_choice="required").
             # Esto evita que el modelo pida confirmación innecesaria.
-            ASK_PATTERNS = ["podrías decirme", "necesito más información",
-                            "¿podrías", "¿podría", "could you", "please provide",
-                            "asumiré", "en qué ciudad", "en qué país", "qué semana"]
+            ASK_PATTERNS = [
+                "podrías decirme", "necesito más información",
+                "¿podrías", "¿podría", "could you", "please provide",
+                "asumiré", "en qué ciudad", "en qué país", "qué semana",
+                "¿te gustaría", "¿quieres", "¿deseas", "would you like",
+                "do you want", "por favor", "proporciona", "dime",
+                "no se puede obtener", "no puedo obtener", "no es posible obtener",
+                "no tengo acceso", "no dispongo", "sin embargo, puedo",
+            ]
             if not message.tool_calls and message.content:
-                content_lower = message.content.lower()
-                if any(p in content_lower for p in ASK_PATTERNS):
+                if any(p in message.content.lower() for p in ASK_PATTERNS):
                     response = self.client.chat.completions.create(
                         model=MODEL,
                         messages=self.history,
@@ -335,7 +356,7 @@ class RappiAgent:
                 for tool_call in message.tool_calls:
                     tool_name = tool_call.function.name
                     tool_args = json.loads(tool_call.function.arguments)
-                    tool_args = _normalize_locations(user_message, tool_args, self.metrics_df)
+                    tool_args = _normalize_locations(tool_args, self.metrics_df)
 
                     result = _dispatch_tool(tool_name, tool_args,
                                             self.metrics_df, self.orders_df)
@@ -354,24 +375,14 @@ class RappiAgent:
                 )
                 message = response.choices[0].message
 
-            response_text = message.content or ""
+            response_text = message.content or "No pude generar una respuesta. Intenta reformular la pregunta."
 
         except groq.BadRequestError:
             # El modelo generó un tool call con schema inválido.
-            # Limpiamos mensajes de tool del historial y reintentamos sin tools.
-            self.history = [
-                m for m in self.history
-                if isinstance(m, dict) and m.get("role") in ("system", "user")
-            ]
-            try:
-                fallback = self.client.chat.completions.create(
-                    model=MODEL,
-                    messages=self.history,
-                )
-                response_text = fallback.choices[0].message.content or ""
-            except Exception:
-                response_text = "Ocurrió un error procesando tu pregunta. Intenta reformularla."
-                self.history.pop()
+            # Reseteamos al estado inicial (solo system prompt) para evitar que
+            # el historial de fallos confunda los siguientes intentos.
+            self.history = [{"role": "system", "content": self.history[0]["content"]}]
+            response_text = "No pude procesar esa consulta correctamente. Intenta reformularla con más detalle."
 
         # Guarda la respuesta final del asistente en el historial
         self.history.append({"role": "assistant", "content": response_text})

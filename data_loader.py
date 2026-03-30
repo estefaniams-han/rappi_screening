@@ -19,6 +19,17 @@ ID_COLS = ["COUNTRY", "CITY", "ZONE", "ZONE_TYPE", "ZONE_PRIORITIZATION", "METRI
 ID_COLS_ORDERS = ["COUNTRY", "CITY", "ZONE", "METRIC"]
 
 
+def _clean_df(df: pd.DataFrame, str_cols: list[str]) -> pd.DataFrame:
+    """Estandariza strings, normaliza país y aplica title case a zona/ciudad."""
+    for col in str_cols:
+        df[col] = df[col].astype(str).str.strip()
+    df["COUNTRY"] = df["COUNTRY"].map(COUNTRY_CODE_TO_NAME).fillna(df["COUNTRY"])
+    for col in ["ZONE", "CITY"]:
+        if col in df.columns:
+            df[col] = df[col].str.replace("_", " ", regex=False).str.title()
+    return df
+
+
 def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Carga y limpia los dos datasets del Excel.
@@ -31,43 +42,27 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
 
     # --- Dataset 1: métricas operacionales ---
     metrics_df = xl.parse("RAW_INPUT_METRICS")
-
-    # Nos quedamos solo con las columnas que necesitamos
     available_week_cols = [c for c in WEEK_COLS if c in metrics_df.columns]
-    metrics_df = metrics_df[ID_COLS + available_week_cols].copy()
-
-    # Estandarizamos strings para evitar problemas de mayúsculas/espacios
-    for col in ["COUNTRY", "CITY", "ZONE", "ZONE_TYPE", "ZONE_PRIORITIZATION", "METRIC"]:
-        metrics_df[col] = metrics_df[col].astype(str).str.strip()
-
-    # Códigos de país → nombres completos
-    metrics_df["COUNTRY"] = metrics_df["COUNTRY"].map(COUNTRY_CODE_TO_NAME).fillna(metrics_df["COUNTRY"])
-
-    # Reemplazamos underscores por espacios y aplicamos title case
-    for col in ["ZONE", "CITY"]:
-        metrics_df[col] = (
-            metrics_df[col]
-            .str.replace("_", " ", regex=False)
-            .str.title()
-        )
+    metrics_df = _clean_df(
+        metrics_df[ID_COLS + available_week_cols].copy(),
+        str_cols=["COUNTRY", "CITY", "ZONE", "ZONE_TYPE", "ZONE_PRIORITIZATION", "METRIC"],
+    )
+    # Normaliza métricas de proporción (0-1) que estén almacenadas como porcentaje (>1).
+    # Itera hasta que todos los valores estén en rango [0, 1].
+    proportion_metrics = [m for m in metrics_df["METRIC"].unique()
+                          if m not in {"Gross Profit UE"}]
+    mask = metrics_df["METRIC"].isin(proportion_metrics)
+    for col in available_week_cols:
+        while (metrics_df.loc[mask, col] > 1).any():
+            metrics_df.loc[mask & (metrics_df[col] > 1), col] /= 100
 
     # --- Dataset 2: órdenes ---
     orders_df = xl.parse("RAW_ORDERS")
-
     available_order_cols = [c for c in WEEK_COLS_ORDERS if c in orders_df.columns]
-    orders_df = orders_df[ID_COLS_ORDERS + available_order_cols].copy()
-
-    for col in ["COUNTRY", "CITY", "ZONE", "METRIC"]:
-        orders_df[col] = orders_df[col].astype(str).str.strip()
-
-    orders_df["COUNTRY"] = orders_df["COUNTRY"].map(COUNTRY_CODE_TO_NAME).fillna(orders_df["COUNTRY"])
-
-    for col in ["ZONE", "CITY"]:
-        orders_df[col] = (
-            orders_df[col]
-            .str.replace("_", " ", regex=False)
-            .str.title()
-        )
+    orders_df = _clean_df(
+        orders_df[ID_COLS_ORDERS + available_order_cols].copy(),
+        str_cols=["COUNTRY", "CITY", "ZONE", "METRIC"],
+    )
 
     return metrics_df, orders_df
 

@@ -10,11 +10,12 @@ rappi_screening/
 ├── data_loader.py      # Carga y limpieza de datos
 ├── bot/
 │   ├── agent.py        # Agente conversacional (Groq + function calling)
-│   ├── tools.py        # Herramientas de análisis sobre pandas
+│   ├── tools.py        # Herramientas de análisis sobre pandas (6 tools)
 │   └── prompts.py      # System prompt del asistente
 ├── insights/
 │   ├── analyzer.py     # Detección automática de anomalías, tendencias, etc.
-│   └── reporter.py     # Generación de reporte ejecutivo con LLM
+│   ├── reporter.py     # Generación de reporte ejecutivo con LLM
+│   └── pdf_export.py   # Exportación a PDF (insights y resultados del chat)
 └── data/raw/           # Dataset Excel (no incluido en el repo)
 ```
 
@@ -86,7 +87,16 @@ Genera un análisis ejecutivo semanal con:
 
 Incluye reporte narrativo generado por LLM y exportación a Excel.
 
-## Modelo LLM
+## Modelo LLM y costos
 
-Usa `meta-llama/llama-4-scout-17b-16e-instruct` vía Groq API (gratuita).
+Usa `meta-llama/llama-4-scout-17b-16e-instruct` vía [Groq API](https://console.groq.com/) (tier gratuito disponible).
 El modelo selecciona y ejecuta herramientas de análisis pandas mediante function calling.
+
+**Costo estimado por uso:**
+
+| Escenario | Costo |
+|-----------|-------|
+| Sesión de 10 preguntas al chatbot | ~$0.00 (Llama 4 Scout en Groq es gratuito en el free tier) |
+| Generación de reporte de insights | ~$0.00 (una llamada de ~1,000 tokens) |
+
+Groq ofrece un free tier generoso (actualmente sin costo para modelos Llama). Si se escala a producción con mayor volumen, el costo sería de ~$0.11 por millón de tokens de entrada y ~$0.34 por millón de tokens de salida según los precios actuales de Groq.

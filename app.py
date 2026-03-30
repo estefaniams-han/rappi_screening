@@ -9,14 +9,7 @@ from insights.analyzer import run_all
 from insights.reporter import generate_report
 from insights.pdf_export import insights_to_pdf, chat_result_to_pdf
 
-st.set_page_config(
-    page_title="Rappi Intelligence",
-    page_icon="🛵",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-st.markdown("""
+_CSS = """
 <style>
 /* === DARK MODE === */
 html, body,
@@ -212,7 +205,16 @@ html, body, [class*="css"] {
 .block-container { padding-top: 1.75rem !important; max-width: 1100px !important; }
 footer, #MainMenu { visibility: hidden; }
 </style>
-""", unsafe_allow_html=True)
+"""
+
+st.set_page_config(
+    page_title="Rappi Intelligence",
+    page_icon="🛵",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(_CSS, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
 # Datos y agente
@@ -501,7 +503,7 @@ with tab_insights:
             fig.update_layout(height=350, plot_bgcolor=BG, paper_bgcolor=BG,
                               font_color="#e5e7eb", font_family="Inter", title_font_size=13,
                               margin=dict(l=0, r=0, t=35, b=0))
-            st.plotly_chart(fig, use_container_width=True, key=key)
+            st.plotly_chart(fig, use_container_width=True, key="bench_chart")
 
         # --- Correlaciones ---
         if data["correlations"]:
