@@ -1,7 +1,6 @@
 import os
 import json
-import re
-import inspect
+import unicodedata
 from dotenv import load_dotenv
 import groq
 from groq import Groq
@@ -21,13 +20,6 @@ from data_loader import COUNTRY_CODE_TO_NAME
 load_dotenv(override=True)
 
 MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-
-# ---------------------------------------------------------------------------
-# Definición de tools para Groq (formato OpenAI function calling)
-# ---------------------------------------------------------------------------
-# Groq usa el mismo formato de tools que OpenAI: una lista de dicts con
-# "type": "function" y la definición de la función con sus parámetros.
-
 
 TOOL_DEFINITIONS = [
     {
@@ -164,23 +156,27 @@ TOOL_DEFINITIONS = [
     },
 ]
 
+ASK_PATTERNS = [
+    "podrías decirme", "necesito más información",
+    "¿podrías", "¿podría", "could you", "please provide",
+    "asumiré", "en qué ciudad", "en qué país", "qué semana",
+    "¿te gustaría", "¿quieres", "¿deseas", "would you like",
+    "do you want", "por favor", "proporciona", "dime",
+    "no se puede obtener", "no puedo obtener", "no es posible obtener",
+    "no tengo acceso", "no dispongo", "sin embargo, puedo",
+]
 
-# ---------------------------------------------------------------------------
-# Normalizador de ubicaciones: fuzzy-match zona/ciudad contra los datos reales
-# ---------------------------------------------------------------------------
+
+def _strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", s)
+                   if unicodedata.category(c) != "Mn")
+
 
 def _normalize_locations(args: dict, metrics_df: pd.DataFrame) -> dict:
-    """
-    Corrige nombres de zona, ciudad y país para que coincidan con los datos reales.
-    País: fuzzy match contra los nombres completos del DataFrame (Argentina, México, etc.)
-    Zona/Ciudad/Métrica: fuzzy match case-insensitive.
-    """
     normalized = dict(args)
 
-    # Normaliza país: primero intenta el mapeo de código (MX→México), luego fuzzy match
     if normalized.get("country"):
         query = normalized["country"].strip()
-        # Lookup directo por código (ej. "MX" → "México")
         code_upper = query.upper()
         if code_upper in COUNTRY_CODE_TO_NAME:
             normalized["country"] = COUNTRY_CODE_TO_NAME[code_upper]
@@ -191,11 +187,6 @@ def _normalize_locations(args: dict, metrics_df: pd.DataFrame) -> dict:
             if exact:
                 normalized["country"] = exact[0]
             else:
-                # Normaliza tildes para comparación (México→mexico, Brasil→brasil)
-                import unicodedata
-                def _strip_accents(s):
-                    return "".join(c for c in unicodedata.normalize("NFD", s)
-                                   if unicodedata.category(c) != "Mn")
                 q_clean = _strip_accents(query_lower)
                 partial = [c for c in country_candidates
                            if q_clean in _strip_accents(c.lower())
@@ -206,7 +197,6 @@ def _normalize_locations(args: dict, metrics_df: pd.DataFrame) -> dict:
     metric_candidates = metrics_df["METRIC"].dropna().unique()
 
     def _fuzzy_metric(name: str) -> str:
-        """Fuzzy match de un nombre de métrica contra los datos reales."""
         query = name.strip().lower()
         exact = [c for c in metric_candidates if c.lower() == query]
         if exact:
@@ -216,7 +206,6 @@ def _normalize_locations(args: dict, metrics_df: pd.DataFrame) -> dict:
             return min(partial, key=len)
         return name
 
-    # Fuzzy match para zona, ciudad y métrica (nivel superior)
     for field, col in [("zone", "ZONE"), ("city", "CITY"), ("metric", "METRIC")]:
         if not normalized.get(field):
             continue
@@ -232,7 +221,6 @@ def _normalize_locations(args: dict, metrics_df: pd.DataFrame) -> dict:
         elif len(partial) > 1:
             normalized[field] = min(partial, key=len)
 
-    # Fuzzy match para métricas dentro de conditions (multivariable_filter)
     if "conditions" in normalized and isinstance(normalized["conditions"], list):
         for cond in normalized["conditions"]:
             if isinstance(cond, dict) and cond.get("metric"):
@@ -241,12 +229,7 @@ def _normalize_locations(args: dict, metrics_df: pd.DataFrame) -> dict:
     return normalized
 
 
-# ---------------------------------------------------------------------------
-# Despachador: mapea nombre de función -> función Python real
-# ---------------------------------------------------------------------------
-
 def _coerce_args(args: dict) -> dict:
-    """Convierte strings a int/bool cuando el modelo los manda con tipo incorrecto."""
     result = {}
     for k, v in args.items():
         if v == "" or v is None:
@@ -262,7 +245,6 @@ def _coerce_args(args: dict) -> dict:
 
 def _dispatch_tool(name: str, args: dict,
                    metrics_df: pd.DataFrame, orders_df: pd.DataFrame) -> dict:
-    """Ejecuta la tool correspondiente con los argumentos que decidió el LLM."""
     args = _coerce_args(args)
     if name == "get_top_zones":
         return get_top_zones(metrics_df, **args)
@@ -280,65 +262,29 @@ def _dispatch_tool(name: str, args: dict,
         return {"error": f"Tool desconocida: {name}"}
 
 
-# ---------------------------------------------------------------------------
-# Agente principal
-# ---------------------------------------------------------------------------
-
 class RappiAgent:
-    """
-    Agente conversacional que usa Groq (Llama 3.3 70B) + function calling
-    para responder preguntas sobre métricas operacionales de Rappi.
-
-    Mantiene el historial de la conversación para tener memoria contextual.
-    """
 
     def __init__(self, metrics_df: pd.DataFrame, orders_df: pd.DataFrame):
         self.metrics_df = metrics_df
         self.orders_df = orders_df
         self.client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
-        # Historial de la conversación: lista de dicts con role y content.
-        # Siempre empieza con el system prompt que define el comportamiento del bot.
         self.history: list[dict] = [
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
 
     def chat(self, user_message: str) -> tuple[str, dict | None]:
-        """
-        Procesa un mensaje del usuario y retorna la respuesta del agente.
-
-        Returns:
-            response_text: respuesta en lenguaje natural
-            tool_result: datos crudos de la tool (para graficar en la UI), o None
-        """
         tool_result = None
-
-        # Agrega el mensaje del usuario al historial
         self.history.append({"role": "user", "content": user_message})
 
         try:
-            # --- Ronda 1: LLM decide si usar una tool o responder directo ---
             response = self.client.chat.completions.create(
                 model=MODEL,
                 messages=self.history,
                 tools=TOOL_DEFINITIONS,
                 tool_choice="auto",
             )
-
             message = response.choices[0].message
 
-            # Si el modelo respondió con texto pero la pregunta parece requerir datos,
-            # reintentamos forzando que use una tool (tool_choice="required").
-            # Esto evita que el modelo pida confirmación innecesaria.
-            ASK_PATTERNS = [
-                "podrías decirme", "necesito más información",
-                "¿podrías", "¿podría", "could you", "please provide",
-                "asumiré", "en qué ciudad", "en qué país", "qué semana",
-                "¿te gustaría", "¿quieres", "¿deseas", "would you like",
-                "do you want", "por favor", "proporciona", "dime",
-                "no se puede obtener", "no puedo obtener", "no es posible obtener",
-                "no tengo acceso", "no dispongo", "sin embargo, puedo",
-            ]
             if not message.tool_calls and message.content:
                 if any(p in message.content.lower() for p in ASK_PATTERNS):
                     response = self.client.chat.completions.create(
@@ -349,7 +295,6 @@ class RappiAgent:
                     )
                     message = response.choices[0].message
 
-            # Verifica si el LLM quiere llamar una o más funciones
             if message.tool_calls:
                 self.history.append(message)
 
@@ -368,7 +313,6 @@ class RappiAgent:
                         "content": json.dumps(result, ensure_ascii=False),
                     })
 
-                # --- Ronda 2: LLM narra el resultado en lenguaje natural ---
                 response = self.client.chat.completions.create(
                     model=MODEL,
                     messages=self.history,
@@ -378,17 +322,11 @@ class RappiAgent:
             response_text = message.content or "No pude generar una respuesta. Intenta reformular la pregunta."
 
         except groq.BadRequestError:
-            # El modelo generó un tool call con schema inválido.
-            # Reseteamos al estado inicial (solo system prompt) para evitar que
-            # el historial de fallos confunda los siguientes intentos.
             self.history = [{"role": "system", "content": self.history[0]["content"]}]
             response_text = "No pude procesar esa consulta correctamente. Intenta reformularla con más detalle."
 
-        # Guarda la respuesta final del asistente en el historial
         self.history.append({"role": "assistant", "content": response_text})
-
         return response_text, tool_result
 
     def reset(self):
-        """Limpia el historial manteniendo solo el system prompt."""
         self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
