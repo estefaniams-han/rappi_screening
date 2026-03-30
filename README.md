@@ -85,7 +85,7 @@ Genera un análisis ejecutivo semanal con:
 - **Correlaciones**: pares de métricas que se mueven juntas (r > 0.65)
 - **Oportunidades**: zonas de alto volumen con métricas rezagadas
 
-Incluye reporte narrativo generado por LLM y exportación a Excel.
+Incluye reporte narrativo generado por LLM y exportación a Excel y PDF.
 
 ## Modelo LLM y costos
 
