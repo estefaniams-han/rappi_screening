@@ -64,31 +64,49 @@ def _build_summary(insights: dict) -> str:
     anomalies = insights.get("anomalies", [])
     if anomalies:
         top = anomalies[:5]
-        lines = [
-            f"- {a['zone']} ({a['country']}): {a['metric']} cambió {a['change_pct']:+.1f}% "
-            f"({'deterioro' if a['is_deterioration'] else 'mejora'}, severidad {a['severity']})"
-            for a in top
-        ]
+        lines = []
+        for a in top:
+            unit = a.get("unit", "%")
+            if unit != "%":
+                change_desc = f"pasó de {a['value_prev']} a {a['value_curr']} {unit}"
+            else:
+                change_desc = f"cambió {a['change_pct']:+.1f}%"
+            lines.append(
+                f"- {a['zone']} ({a['country']}): {a['metric']} {change_desc} "
+                f"({'deterioro' if a['is_deterioration'] else 'mejora'}, severidad {a['severity']})"
+            )
         parts.append("ANOMALÍAS (cambios bruscos semana a semana):\n" + "\n".join(lines))
 
     trends = insights.get("worrying_trends", [])
     if trends:
         top = trends[:5]
-        lines = [
-            f"- {t['zone']} ({t['country']}): {t['metric']} cayó {t['total_change_pct']:.1f}% "
-            f"en {t['weeks_declining']} semanas consecutivas"
-            for t in top
-        ]
+        lines = []
+        for t in top:
+            unit = t.get("unit", "%")
+            if unit != "%" and t.get("abs_change") is not None:
+                change_desc = (
+                    f"pasó de {t['value_start']} a {t['value_end']} {unit} "
+                    f"(cambio absoluto: {t['abs_change']:+.4f} {unit})"
+                )
+            else:
+                change_desc = f"cayó {t['total_change_pct']:.1f}%"
+            lines.append(
+                f"- {t['zone']} ({t['country']}): {t['metric']} {change_desc} "
+                f"en {t['weeks_declining']} semanas consecutivas"
+            )
         parts.append("TENDENCIAS PREOCUPANTES (deterioro consistente):\n" + "\n".join(lines))
 
     benchmarking = insights.get("benchmarking", [])
     if benchmarking:
         top = benchmarking[:5]
-        lines = [
-            f"- {b['zone']} ({b['country']}): {b['metric']} = {b['zone_value']:.1f}% "
-            f"vs promedio del grupo {b['group_avg']:.1f}% (z={b['z_score']:.1f})"
-            for b in top
-        ]
+        lines = []
+        for b in top:
+            unit = b.get("unit", "%")
+            if unit != "%":
+                val_str = f"{b['zone_value']:.4f} {unit} vs promedio {b['group_avg']:.4f} {unit}"
+            else:
+                val_str = f"{b['zone_value']:.1f}% vs promedio del grupo {b['group_avg']:.1f}%"
+            lines.append(f"- {b['zone']} ({b['country']}): {b['metric']} = {val_str} (z={b['z_score']:.1f})")
         parts.append("BENCHMARKING (zonas por debajo de su grupo):\n" + "\n".join(lines))
 
     correlations = insights.get("correlations", [])
@@ -105,10 +123,17 @@ def _build_summary(insights: dict) -> str:
         top = opportunities[:5]
         lagging_strs = []
         for o in top:
-            metrics_str = ", ".join(
-                f"{m['metric']} ({m['gap_pct']:.1f}% bajo promedio)"
-                for m in o["lagging_metrics"]
-            )
+            metrics_parts = []
+            for m in o["lagging_metrics"]:
+                unit = m.get("unit", "%")
+                if unit != "%" and m.get("abs_gap") is not None:
+                    metrics_parts.append(
+                        f"{m['metric']} ({m['value']} vs avg {m['global_avg']} {unit}, "
+                        f"diff {m['abs_gap']:+.4f} {unit})"
+                    )
+                else:
+                    metrics_parts.append(f"{m['metric']} ({m['gap_pct']:.1f}% bajo promedio)")
+            metrics_str = ", ".join(metrics_parts)
             lagging_strs.append(
                 f"- {o['zone']} ({o['country']}): {o['orders']:,} órdenes/sem — métricas rezagadas: {metrics_str}"
             )

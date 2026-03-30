@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from data_loader import WEEK_COLS, WEEK_COLS_ORDERS
+from bot.tools import _to_display, _unit
 
 # Las 3 semanas más recientes y la actual
 W0, W1, W2, W3 = "L0W_ROLL", "L1W_ROLL", "L2W_ROLL", "L3W_ROLL"
@@ -33,25 +34,47 @@ def detect_anomalies(metrics_df: pd.DataFrame, threshold: float = 10.0) -> list[
     Retorna lista de hallazgos ordenada por magnitud de cambio.
     """
     results = []
-    df = metrics_df[[*["COUNTRY", "CITY", "ZONE", "ZONE_TYPE", "METRIC"], W0, W1]].dropna(subset=[W0, W1])
+    df = (
+        metrics_df[[*["COUNTRY", "CITY", "ZONE", "ZONE_TYPE", "METRIC"], W0, W1]]
+        .dropna(subset=[W0, W1])
+        .drop_duplicates(subset=["COUNTRY", "ZONE", "METRIC"])
+    )
 
     for _, row in df.iterrows():
         change = _pct_change(row[W0], row[W1])
         if pd.isna(change) or abs(change) < threshold:
             continue
 
-        deterioro = _is_deterioration(row["METRIC"], change)
+        metric = row["METRIC"]
+        unit = _unit(metric)
+        abs_change = row[W0] - row[W1]
+
+        # Para métricas no-proporción (GP UE), filtrar cambios absolutos pequeños
+        # que producen % absurdos por divisores near-zero
+        if unit != "%" and abs(abs_change) < 0.3:
+            continue
+
+        deterioro = _is_deterioration(metric, change)
+
+        # Severidad: para GP UE usar cambio absoluto; para el resto usar % change
+        if unit != "%":
+            severity = "alta" if abs(abs_change) > 1.0 else "media"
+        else:
+            severity = "alta" if abs(change) > 25 else "media"
+
         results.append({
             "country": row["COUNTRY"],
             "city": row["CITY"],
             "zone": row["ZONE"],
             "zone_type": row["ZONE_TYPE"],
-            "metric": row["METRIC"],
-            "value_prev": round(row[W1] * 100, 2),
-            "value_curr": round(row[W0] * 100, 2),
+            "metric": metric,
+            "unit": unit,
+            "value_prev": _to_display(row[W1], metric),
+            "value_curr": _to_display(row[W0], metric),
             "change_pct": round(change, 2),
+            "abs_change": round(abs_change, 4) if unit != "%" else None,
             "is_deterioration": deterioro,
-            "severity": "alta" if abs(change) > 25 else "media",
+            "severity": severity,
         })
 
     results.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
@@ -69,7 +92,11 @@ def detect_worrying_trends(metrics_df: pd.DataFrame, min_weeks: int = 3) -> list
     results = []
     week_cols = WEEK_COLS[-min_weeks - 1:]  # necesitamos N+1 puntos para N cambios
 
-    df = metrics_df[["COUNTRY", "CITY", "ZONE", "ZONE_TYPE", "METRIC"] + week_cols].dropna(subset=week_cols)
+    df = (
+        metrics_df[["COUNTRY", "CITY", "ZONE", "ZONE_TYPE", "METRIC"] + week_cols]
+        .dropna(subset=week_cols)
+        .drop_duplicates(subset=["COUNTRY", "ZONE", "METRIC"])
+    )
 
     for _, row in df.iterrows():
         values = [row[c] for c in week_cols]
@@ -90,16 +117,19 @@ def detect_worrying_trends(metrics_df: pd.DataFrame, min_weeks: int = 3) -> list
         if pd.isna(total_change) or abs(total_change) < 5:
             continue
 
+        unit = _unit(metric)
         results.append({
             "country": row["COUNTRY"],
             "city": row["CITY"],
             "zone": row["ZONE"],
             "zone_type": row["ZONE_TYPE"],
-            "metric": row["METRIC"],
+            "metric": metric,
+            "unit": unit,
             "weeks_declining": min_weeks,
-            "value_start": round(values[0] * 100, 2),
-            "value_end": round(values[-1] * 100, 2),
+            "value_start": _to_display(values[0], metric),
+            "value_end": _to_display(values[-1], metric),
             "total_change_pct": round(total_change, 2),
+            "abs_change": round(values[-1] - values[0], 4) if unit != "%" else None,
         })
 
     results.sort(key=lambda x: x["total_change_pct"])
@@ -116,7 +146,11 @@ def detect_benchmarking(metrics_df: pd.DataFrame, z_threshold: float = 1.5) -> l
     Detecta zonas que están >z_threshold desviaciones estándar por debajo del grupo.
     """
     results = []
-    df = metrics_df[["COUNTRY", "CITY", "ZONE", "ZONE_TYPE", "METRIC", W0]].dropna(subset=[W0])
+    df = (
+        metrics_df[["COUNTRY", "CITY", "ZONE", "ZONE_TYPE", "METRIC", W0]]
+        .dropna(subset=[W0])
+        .drop_duplicates(subset=["COUNTRY", "ZONE", "METRIC"])
+    )
 
     for (country, zone_type, metric), group in df.groupby(["COUNTRY", "ZONE_TYPE", "METRIC"]):
         if len(group) < 3:
@@ -144,8 +178,9 @@ def detect_benchmarking(metrics_df: pd.DataFrame, z_threshold: float = 1.5) -> l
                 "zone": row["ZONE"],
                 "zone_type": zone_type,
                 "metric": metric,
-                "zone_value": round(row[W0] * 100, 2),
-                "group_avg": round(mean * 100, 2),
+                "unit": _unit(metric),
+                "zone_value": _to_display(row[W0], metric),
+                "group_avg": _to_display(mean, metric),
                 "gap_pct": round((row[W0] - mean) / abs(mean) * 100, 2) if mean != 0 else 0,
                 "z_score": round(z, 2),
             })
@@ -213,9 +248,13 @@ def detect_opportunities(metrics_df: pd.DataFrame, orders_df: pd.DataFrame) -> l
 
     # Métricas clave a revisar
     key_metrics = ["Perfect Orders", "Lead Penetration", "Non-Pro PTC > OP", "Gross Profit UE"]
-    df = metrics_df[metrics_df["METRIC"].isin(key_metrics)][
-        ["COUNTRY", "ZONE", "ZONE_TYPE", "METRIC", W0]
-    ].dropna(subset=[W0])
+    df = (
+        metrics_df[metrics_df["METRIC"].isin(key_metrics)][
+            ["COUNTRY", "ZONE", "ZONE_TYPE", "METRIC", W0]
+        ]
+        .dropna(subset=[W0])
+        .drop_duplicates(subset=["COUNTRY", "ZONE", "METRIC"])
+    )
 
     # Promedio global por métrica
     global_avg = df.groupby("METRIC")[W0].mean()
@@ -232,12 +271,20 @@ def detect_opportunities(metrics_df: pd.DataFrame, orders_df: pd.DataFrame) -> l
             if avg is None or pd.isna(avg) or avg == 0:
                 continue
             gap = (row[W0] - avg) / abs(avg) * 100
-            if gap < -15:  # está >15% por debajo del promedio global
+            abs_diff = row[W0] - avg
+            # Para métricas no-proporción (ej: GP UE), el gap % es inestable cuando avg ≈ 0.
+            # Se considera rezagada si cumple el gap % O si la diferencia absoluta es significativa (>0.3 USD/orden).
+            non_ratio = _unit(metric) != "%"
+            is_lagging = gap < -15 or (non_ratio and abs_diff < -0.3)
+            if is_lagging:  # está rezagada respecto al promedio global
+                unit = _unit(metric)
                 lagging.append({
                     "metric": metric,
-                    "value": round(row[W0] * 100, 2),
-                    "global_avg": round(avg * 100, 2),
+                    "unit": unit,
+                    "value": _to_display(row[W0], metric),
+                    "global_avg": _to_display(avg, metric),
                     "gap_pct": round(gap, 2),
+                    "abs_gap": round(row[W0] - avg, 4) if unit != "%" else None,
                 })
 
         if not lagging:

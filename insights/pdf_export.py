@@ -138,32 +138,46 @@ def insights_to_pdf(insights: dict, report_text: str) -> bytes:
     anomalies = insights.get("anomalies", [])
     if anomalies:
         _section_title(pdf, f"Anomalías ({len(anomalies)} detectadas)")
-        headers = ["País", "Ciudad", "Zona", "Métrica", "Anterior %", "Actual %", "Cambio %", "Estado"]
-        rows = [
-            [
-                a["country"], a["city"], a["zone"][:25], a["metric"][:30],
-                f"{a['value_prev']:.1f}", f"{a['value_curr']:.1f}",
-                f"{a['change_pct']:+.1f}",
+        headers = ["País", "Ciudad", "Zona", "Métrica", "Unidad", "Anterior", "Actual", "Cambio", "Estado"]
+        rows = []
+        for a in anomalies[:20]:
+            unit = a.get("unit", "%")
+            if unit != "%" and a.get("abs_change") is not None:
+                cambio = f"{a['abs_change']:+.4f}"
+                prev = f"{a['value_prev']:.4f}"
+                curr = f"{a['value_curr']:.4f}"
+            else:
+                cambio = f"{a['change_pct']:+.1f}%"
+                prev = f"{a['value_prev']:.1f}"
+                curr = f"{a['value_curr']:.1f}"
+            rows.append([
+                a["country"], a["city"], a["zone"][:25], a["metric"][:28],
+                unit, prev, curr, cambio,
                 "Deterioro" if a["is_deterioration"] else "Mejora",
-            ]
-            for a in anomalies[:20]
-        ]
-        _table(pdf, headers, rows, [22, 22, 30, 38, 18, 18, 20, 22])
+            ])
+        _table(pdf, headers, rows, [20, 20, 28, 32, 16, 16, 16, 22, 20])
 
     # Tendencias
     trends = insights.get("worrying_trends", [])
     if trends:
         _section_title(pdf, f"Tendencias preocupantes ({len(trends)} detectadas)")
-        headers = ["País", "Ciudad", "Zona", "Métrica", "Inicio %", "Fin %", "Cambio %"]
-        rows = [
-            [
+        headers = ["País", "Ciudad", "Zona", "Métrica", "Unidad", "Inicio", "Fin", "Cambio"]
+        rows = []
+        for t in trends[:20]:
+            unit = t.get("unit", "%")
+            if unit != "%" and t.get("abs_change") is not None:
+                cambio = f"{t['abs_change']:+.4f}"
+                start = f"{t['value_start']:.4f}"
+                end = f"{t['value_end']:.4f}"
+            else:
+                cambio = f"{t['total_change_pct']:+.1f}%"
+                start = f"{t['value_start']:.1f}"
+                end = f"{t['value_end']:.1f}"
+            rows.append([
                 t["country"], t["city"], t["zone"][:25], t["metric"][:32],
-                f"{t['value_start']:.1f}", f"{t['value_end']:.1f}",
-                f"{t['total_change_pct']:+.1f}",
-            ]
-            for t in trends[:20]
-        ]
-        _table(pdf, headers, rows, [22, 22, 30, 40, 20, 20, 26])
+                unit, start, end, cambio,
+            ])
+        _table(pdf, headers, rows, [22, 22, 30, 36, 16, 18, 18, 28])
 
     # Oportunidades
     opportunities = insights.get("opportunities", [])
@@ -172,12 +186,21 @@ def insights_to_pdf(insights: dict, report_text: str) -> bytes:
         rows = []
         for o in opportunities:
             for m in o["lagging_metrics"]:
+                unit = m.get("unit", "%")
+                if unit != "%" and m.get("abs_gap") is not None:
+                    value_str = f"{m['value']:.4f}"
+                    avg_str = f"{m['global_avg']:.4f}"
+                    gap_str = f"{m['abs_gap']:+.4f}"
+                else:
+                    value_str = f"{m['value']:.1f}%"
+                    avg_str = f"{m['global_avg']:.1f}%"
+                    gap_str = f"{m['gap_pct']:.1f}%"
                 rows.append([
                     o["country"], o["zone"][:25], f"{o['orders']:,}",
-                    m["metric"][:30], f"{m['value']:.1f}", f"{m['global_avg']:.1f}", f"{m['gap_pct']:.1f}%",
+                    m["metric"][:30], unit, value_str, avg_str, gap_str,
                 ])
-        headers = ["País", "Zona", "Órdenes", "Métrica", "Valor %", "Avg global %", "Gap"]
-        _table(pdf, headers, rows, [20, 30, 22, 40, 18, 28, 22])
+        headers = ["País", "Zona", "Órdenes", "Métrica", "Unidad", "Valor", "Avg global", "Gap"]
+        _table(pdf, headers, rows, [18, 28, 20, 36, 16, 18, 22, 22])
 
     # Correlaciones
     correlations = insights.get("correlations", [])

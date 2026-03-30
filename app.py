@@ -429,12 +429,25 @@ with tab_insights:
             if data["correlations"]:
                 pd.DataFrame(data["correlations"]).to_excel(writer, sheet_name="Correlaciones", index=False)
             if data["opportunities"]:
-                opp_rows = [
-                    {"zone": o["zone"], "country": o["country"], "orders": o["orders"],
-                     "metric": m["metric"], "value": m["value"],
-                     "global_avg": m["global_avg"], "gap_pct": m["gap_pct"]}
-                    for o in data["opportunities"] for m in o["lagging_metrics"]
-                ]
+                opp_rows = []
+                for o in data["opportunities"]:
+                    for m in o["lagging_metrics"]:
+                        unit = m.get("unit", "%")
+                        row = {
+                            "zone": o["zone"],
+                            "country": o["country"],
+                            "zone_type": o["zone_type"],
+                            "orders/sem": o["orders"],
+                            "metric": m["metric"],
+                            "unit": unit,
+                            "value": m["value"],
+                            "global_avg": m["global_avg"],
+                        }
+                        if unit != "%" and m.get("abs_gap") is not None:
+                            row["gap"] = f"{m['abs_gap']:+.4f} {unit}"
+                        else:
+                            row["gap"] = f"{m['gap_pct']:.1f}%"
+                        opp_rows.append(row)
                 pd.DataFrame(opp_rows).to_excel(writer, sheet_name="Oportunidades", index=False)
         _, exc1, exc2 = st.columns([6, 1, 1])
         with exc1:
@@ -468,9 +481,13 @@ with tab_insights:
             st.markdown("#### Anomalías (cambios bruscos semana a semana)")
             df_anom = pd.DataFrame(data["anomalies"])
             df_anom["estado"] = df_anom["is_deterioration"].map({True: "Deterioro", False: "Mejora"})
-            df_anom["change_pct"] = df_anom["change_pct"].apply(lambda x: f"{x:+.1f}%")
+            def _fmt_anom_change(row):
+                if row.get("unit", "%") != "%" and row.get("abs_change") is not None:
+                    return f"{row['abs_change']:+.4f} {row['unit']}"
+                return f"{row['change_pct']:+.1f}%"
+            df_anom["cambio"] = df_anom.apply(_fmt_anom_change, axis=1)
             st.dataframe(
-                df_anom[["country", "city", "zone", "metric", "value_prev", "value_curr", "change_pct", "estado", "severity"]],
+                df_anom[["country", "city", "zone", "metric", "unit", "value_prev", "value_curr", "cambio", "estado", "severity"]],
                 use_container_width=True, hide_index=True
             )
 
@@ -478,9 +495,13 @@ with tab_insights:
         if data["worrying_trends"]:
             st.markdown("#### Tendencias preocupantes (deterioro consistente 3+ semanas)")
             df_trend = pd.DataFrame(data["worrying_trends"])
-            df_trend["total_change_pct"] = df_trend["total_change_pct"].apply(lambda x: f"{x:+.1f}%")
+            def _fmt_change(row):
+                if row.get("unit", "%") != "%" and row.get("abs_change") is not None:
+                    return f"{row['abs_change']:+.4f} {row['unit']}"
+                return f"{row['total_change_pct']:+.1f}%"
+            df_trend["cambio"] = df_trend.apply(_fmt_change, axis=1)
             st.dataframe(
-                df_trend[["country", "city", "zone", "metric", "value_start", "value_end", "total_change_pct", "weeks_declining"]],
+                df_trend[["country", "city", "zone", "metric", "unit", "value_start", "value_end", "cambio", "weeks_declining"]],
                 use_container_width=True, hide_index=True
             )
 
@@ -489,21 +510,29 @@ with tab_insights:
             st.markdown("#### Benchmarking (zonas por debajo de su grupo)")
             df_bench = pd.DataFrame(data["benchmarking"][:20])
             COLORS = ["#FF6B35", "#FF9F1C", "#2EC4B6", "#3A86FF", "#8338EC"]
-            BG, GRID = "#0f1117", "#1f2232"
-            fig = px.scatter(
-                df_bench, x="group_avg", y="zone_value",
-                color="metric", hover_data=["zone", "country", "z_score"],
-                title="Valor de zona vs promedio del grupo",
-                labels={"zone_value": "Valor zona (%)", "group_avg": "Promedio grupo (%)"},
-                color_discrete_sequence=COLORS,
-            )
-            fig.add_shape(type="line", x0=df_bench["group_avg"].min(), y0=df_bench["group_avg"].min(),
-                          x1=df_bench["group_avg"].max(), y1=df_bench["group_avg"].max(),
-                          line=dict(color="#4b5563", dash="dash"))
-            fig.update_layout(height=350, plot_bgcolor=BG, paper_bgcolor=BG,
-                              font_color="#e5e7eb", font_family="Inter", title_font_size=13,
-                              margin=dict(l=0, r=0, t=35, b=0))
-            st.plotly_chart(fig, use_container_width=True, key="bench_chart")
+            BG = "#0f1117"
+
+            def _bench_chart(df_sub, unit_label, key):
+                if df_sub.empty:
+                    return
+                fig = px.scatter(
+                    df_sub, x="group_avg", y="zone_value",
+                    color="metric", hover_data=["zone", "country", "z_score"],
+                    title=f"Valor de zona vs promedio del grupo ({unit_label})",
+                    labels={"zone_value": f"Valor zona ({unit_label})",
+                            "group_avg": f"Promedio grupo ({unit_label})"},
+                    color_discrete_sequence=COLORS,
+                )
+                mn, mx = df_sub["group_avg"].min(), df_sub["group_avg"].max()
+                fig.add_shape(type="line", x0=mn, y0=mn, x1=mx, y1=mx,
+                              line=dict(color="#4b5563", dash="dash"))
+                fig.update_layout(height=350, plot_bgcolor=BG, paper_bgcolor=BG,
+                                  font_color="#e5e7eb", font_family="Inter", title_font_size=13,
+                                  margin=dict(l=0, r=0, t=35, b=0))
+                st.plotly_chart(fig, use_container_width=True, key=key)
+
+            _bench_chart(df_bench[df_bench["unit"] == "%"], "%", "bench_chart_pct")
+            _bench_chart(df_bench[df_bench["unit"] != "%"], "USD/orden", "bench_chart_usd")
 
         # --- Correlaciones ---
         if data["correlations"]:
@@ -520,15 +549,21 @@ with tab_insights:
             rows = []
             for o in data["opportunities"]:
                 for m in o["lagging_metrics"]:
-                    rows.append({
+                    unit = m.get("unit", "%")
+                    row = {
                         "zone": o["zone"],
                         "country": o["country"],
                         "orders/sem": o["orders"],
                         "metric": m["metric"],
-                        "value (%)": m["value"],
-                        "global avg (%)": m["global_avg"],
-                        "gap (%)": f"{m['gap_pct']:.1f}%",
-                    })
+                        "unit": unit,
+                        "value": m["value"],
+                        "global avg": m["global_avg"],
+                    }
+                    if unit != "%" and m.get("abs_gap") is not None:
+                        row["gap"] = f"{m['abs_gap']:+.4f} {unit}"
+                    else:
+                        row["gap"] = f"{m['gap_pct']:.1f}%"
+                    rows.append(row)
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
